@@ -1,6 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Type
+import random
 
 import numpy as np
 import open_clip
@@ -25,6 +26,7 @@ from lerf.lerf_renderers import CLIPRenderer, MeanRenderer
 @dataclass
 class LERFModelConfig(NerfactoModelConfig):
     _target: Type = field(default_factory=lambda: LERFModel)
+    
     clip_loss_weight: float = 0.1
     n_scales: int = 30
     max_scale: float = 1.5
@@ -51,7 +53,9 @@ class LERFModel(NerfactoModel):
             self.config.hashgrid_resolutions,
             clip_n_dims=self.image_encoder.embedding_dim,
         )
-
+        self.suppress = True
+        self.suppress_train = False
+        self.step_counter = 0
         # populate some viewer logic
         # TODO use the values from this code to select the scale
         # def scale_cb(element):
@@ -88,6 +92,7 @@ class LERFModel(NerfactoModel):
 
         # probably not a good idea bc it's prob going to be a lot of memory
         n_phrases = len(self.image_encoder.positives)
+       
         n_phrases_maxs = [None for _ in range(n_phrases)]
         n_phrases_sims = [None for _ in range(n_phrases)]
         for i, scale in enumerate(scales_list):
@@ -103,11 +108,82 @@ class LERFModel(NerfactoModel):
             for j in range(n_phrases):
                 if preset_scales is None or j == i:
                     probs = self.image_encoder.get_relevancy(clip_output, j)
+
+                    #probs = self.image_encoder.get_room_relevancy(clip_output, j)
+
                     pos_prob = probs[..., 0:1]
                     if n_phrases_maxs[j] is None or pos_prob.max() > n_phrases_sims[j].max():
                         n_phrases_maxs[j] = scale
                         n_phrases_sims[j] = pos_prob
+        
         return torch.stack(n_phrases_sims), torch.Tensor(n_phrases_maxs)
+
+    def get_room_across(self, ray_samples, weights, hashgrid_field, scales_shape, preset_scales=None):
+        # TODO smoothen this out
+        if preset_scales is not None:
+            assert len(preset_scales) == len(self.image_encoder.positives)
+            scales_list = torch.tensor(preset_scales)
+        else:
+            scales_list = torch.linspace(0.0, self.config.max_scale, self.config.n_scales)
+
+        n_phrases = len(self.image_encoder.positives)
+       
+        n_phrases_maxs = [None for _ in range(n_phrases)]
+        n_phrases_sims = [None for _ in range(n_phrases)]
+
+        for i, scale in enumerate(scales_list):
+            scale = scale.item()
+            with torch.no_grad():
+                clip_output = self.lerf_field.get_output_from_hashgrid(
+                    ray_samples,
+                    hashgrid_field,
+                    torch.full(scales_shape, scale, device=weights.device, dtype=hashgrid_field.dtype),
+                )
+            clip_output = self.renderer_clip(embeds=clip_output, weights=weights.detach())
+
+            j = 0
+            if preset_scales is None or j == i:
+                    #probs = self.image_encoder.get_relevancy(clip_output, j)
+
+                    probs = self.image_encoder.get_room_relevancy(clip_output, j)
+
+                    pos_prob = probs[..., 0:1] - probs[..., 1:]
+                    #print(pos_prob)
+                    if n_phrases_maxs[j] is None or pos_prob.max() > n_phrases_sims[j].max():
+                        n_phrases_maxs[j] = scale
+                        n_phrases_sims[j] = pos_prob
+        
+        return torch.stack(n_phrases_sims), torch.Tensor(n_phrases_maxs)
+
+        """
+        room_max = 0.0
+        room_sim = torch.zeros((1,1))
+        start = True
+        for i, scale in enumerate(scales_list):
+            scale = scale.item()
+            with torch.no_grad():
+                clip_output = self.lerf_field.get_output_from_hashgrid(
+                    ray_samples,
+                    hashgrid_field,
+                    torch.full(scales_shape, scale, device=weights.device, dtype=hashgrid_field.dtype),
+                )
+            clip_output = self.renderer_clip(embeds=clip_output, weights=weights.detach())
+ #print(outputs['rgb'][:, 0]*over_thresh)
+                print('here')
+            if preset_scales is None:
+                
+                probs = self.image_encoder.get_room_relevancy(clip_output, 0)
+                print(probs)
+                pos_prob = probs[..., 0:1]
+                if start or pos_prob.max() > room_sim.max():
+                        room_max = scale
+                        room_sim = pos_prob
+                        start = False
+        
+        print(room_sim)
+        print(room_max)
+        return room_sim.unsqueeze(dim=0), torch.Tensor([room_max])
+        """
 
     def get_outputs(self, ray_bundle: RayBundle):
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
@@ -150,18 +226,71 @@ class LERFModel(NerfactoModel):
                 embeds=lerf_field_outputs[LERFFieldHeadNames.DINO], weights=lerf_weights.detach()
             )
 
+        if self.suppress_train and self.training:
+            with torch.no_grad():
+                if random.randint(0, 10) > 0:
+                    #print('suppressing during training...')
+                    self.step_counter += 1
+                    if self.step_counter >10000:
+                        max_across, best_scales = self.get_room_across(
+                                    lerf_samples,
+                                    lerf_weights,
+                                    lerf_field_outputs[LERFFieldHeadNames.HASHGRID],
+                                    clip_scales.shape,
+                                    preset_scales=override_scales,
+                                )
+                        threshold = 0.0
+                        #outputs["raw_relevancy"] = max_across  # N x B x 1
+                        #outputs["best_scales"] = best_scales.to(self.device)  # N
+                        #outputs["depth"] = torch.where((outputs["depth"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze()) == 0, 0, (outputs["depth"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze())).unsqueeze(dim=1)  
+                        outputs['depth'] = (outputs['depth'].squeeze()*(max_across >= threshold).long().squeeze()).unsqueeze(dim=1)
+                        
+
+                        #outputs["depth"] = torch.where((outputs["depth"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze()) == 0, 100000, (outputs["depth"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze())).unsqueeze(dim=1)  
+                        #outputs['rgb'][:, 0] = outputs['rgb'][:, 0]*(max_across >= threshold).long().squeeze()
+                        #outputs['rgb'][:, 1] = outputs['rgb'][:, 1]*(max_across >= threshold).long().squeeze()
+                        #outputs['rgb'][:, 2] = outputs['rgb'][:, 2]*(max_across >= threshold).long().squeeze()
+                        del max_across, best_scales
         if not self.training:
             with torch.no_grad():
-                max_across, best_scales = self.get_max_across(
-                    lerf_samples,
-                    lerf_weights,
-                    lerf_field_outputs[LERFFieldHeadNames.HASHGRID],
-                    clip_scales.shape,
-                    preset_scales=override_scales,
-                )
-                outputs["raw_relevancy"] = max_across  # N x B x 1
-                outputs["best_scales"] = best_scales.to(self.device)  # N
+                if self.suppress: 
+                    
+                    max_across, best_scales = self.get_room_across(
+                        lerf_samples,
+                        lerf_weights,
+                        lerf_field_outputs[LERFFieldHeadNames.HASHGRID],
+                        clip_scales.shape,
+                        preset_scales=override_scales,
+                    )
+                    threshold = 0.0
+                    outputs["raw_relevancy"] = max_across  # N x B x 1
+                    outputs["best_scales"] = best_scales.to(self.device)  # N
+                    #print(outputs)
+                    #print(outputs["depth"])
+                    #print((outputs["raw_relevancy"] >= threshold).long().squeeze())
+                    #print(torch.where((outputs["raw_relevancy"] >= threshold).long().squeeze() == 0, -100, (outputs["raw_relevancy"] >= threshold).long().squeeze()))
+                    #print((outputs["raw_relevancy"] >= threshold).long().squeeze())
+                    #outputs["accumulation"] = (outputs["accumulation"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze()).unsqueeze(dim=1)
+                    outputs["depth"] = torch.where((outputs["depth"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze()) == 0, 100000, (outputs["depth"].squeeze() * (outputs["raw_relevancy"] >= threshold).long().squeeze())).unsqueeze(dim=1)
+                    
+                    #outputs["prop_depth_0"] = (outputs["prop_depth_0"].squeeze() *(outputs["raw_relevancy"] >= threshold).long().squeeze()).unsqueeze(dim=1)
+                    #outputs["prop_depth_1"] = (outputs["prop_depth_1"].squeeze() *(outputs["raw_relevancy"] >= threshold).long().squeeze()).unsqueeze(dim=1)
 
+                    #print(outputs["accumulation"])
+                    #outputs['rgb'][:, 0] = outputs['rgb'][:, 0]*(outputs["raw_relevancy"] >= threshold).long().squeeze()
+                    #outputs['rgb'][:, 1] = outputs['rgb'][:, 1]*(outputs["raw_relevancy"] >= threshold).long().squeeze()
+                    #outputs['rgb'][:, 2] = outputs['rgb'][:, 2]*(outputs["raw_relevancy"] >= threshold).long().squeeze()
+                else:
+                    max_across, best_scales = self.get_max_across(
+                        lerf_samples,
+                        lerf_weights,
+                        lerf_field_outputs[LERFFieldHeadNames.HASHGRID],
+                        clip_scales.shape,
+                        preset_scales=override_scales,
+                    )
+                    outputs["raw_relevancy"] = max_across  # N x B x 1
+                    outputs["best_scales"] = best_scales.to(self.device)  # N
+               
         return outputs
 
     @torch.no_grad()
@@ -229,7 +358,7 @@ class LERFModel(NerfactoModel):
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
         depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
-
+        
         outputs = {
             "rgb": rgb,
             "accumulation": accumulation,
