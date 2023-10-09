@@ -35,6 +35,15 @@ class LERFField(Field):
         super().__init__()
         assert len(grid_layers) == len(grid_sizes) and len(grid_resolutions) == len(grid_layers)
         self.spatial_distortion = spatial_distortion
+        """
+        self.direction_encoding = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "SphericalHarmonics",
+                "degree": 4,
+            },
+        )
+
         self.clip_encs = torch.nn.ModuleList(
             [
                 LERFField._get_encoding(
@@ -43,6 +52,11 @@ class LERFField(Field):
             ]
         )
         tot_out_dims = sum([e.n_output_dims for e in self.clip_encs])
+
+        """
+        
+        tot_out_dims = 63
+
         print(tot_out_dims)
         self.clip_net = tcnn.Network(
             n_input_dims=tot_out_dims + 1,
@@ -84,10 +98,10 @@ class LERFField(Field):
         )
         return enc
 
-    def get_outputs(self, ray_samples: RaySamples, clip_scales) -> Dict[LERFFieldHeadNames, TensorType]:
+    def get_outputs(self, ray_samples: RaySamples, clip_scales, embeds) -> Dict[LERFFieldHeadNames, TensorType]:
         # random scales, one scale
         outputs = {}
-        
+        """
         positions = ray_samples.frustums.get_positions().detach()
         positions = self.spatial_distortion(positions)
         positions = (positions + 2.0) / 4.0
@@ -96,13 +110,15 @@ class LERFField(Field):
         
         x = torch.concat(xs, dim=-1)
 
-        outputs[LERFFieldHeadNames.HASHGRID] = x.view(*ray_samples.frustums.shape, -1)
+        """
+        x = embeds
+        x = x.reshape([x.shape[0]*x.shape[1],-1])
+       
         
-        clip_pass = self.clip_net(torch.cat([x, clip_scales.view(-1, 1)], dim=-1))
-        
-        clip_pass = clip_pass.view(*ray_samples.frustums.shape, -1)
-        
-        
+        #outputs[LERFFieldHeadNames.HASHGRID] = x.view(*ray_samples.frustums.shape, -1)
+
+        clip_pass = self.clip_net(torch.cat([x, clip_scales.view(-1,1)], dim=-1)).view(*ray_samples.frustums.shape, -1)
+
         outputs[LERFFieldHeadNames.CLIP] = clip_pass / clip_pass.norm(dim=-1, keepdim=True)
 
         dino_pass = self.dino_net(x).view(*ray_samples.frustums.shape, -1)
@@ -112,7 +128,9 @@ class LERFField(Field):
 
     def get_output_from_hashgrid(self, ray_samples: RaySamples, hashgrid_field, scale):
         # designated scales, run outputs for each scale
-        hashgrid_field = hashgrid_field.view(-1, self.clip_net.n_input_dims - 1)
+        #hashgrid_field = hashgrid_field.view(-1, self.clip_net.n_input_dims - 1)
+        hashgrid_field = hashgrid_field.reshape([hashgrid_field.shape[0]*hashgrid_field.shape[1],-1])
+        
         clip_pass = self.clip_net(torch.cat([hashgrid_field, scale.view(-1, 1)], dim=-1)).view(
             *ray_samples.frustums.shape, -1
         )

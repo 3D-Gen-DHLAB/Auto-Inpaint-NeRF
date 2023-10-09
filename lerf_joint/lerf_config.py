@@ -30,8 +30,8 @@ lerf_method = MethodSpecification(
         pipeline=LERFPipelineConfig(
             datamanager=LERFDataManagerConfig(
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.99),
-                train_num_rays_per_batch=4096,
-                eval_num_rays_per_batch=2048,
+                train_num_rays_per_batch=2048,
+                eval_num_rays_per_batch=1024,
                 camera_optimizer=CameraOptimizerConfig(
                     mode="SO3xR3", optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2)
                 ),
@@ -39,8 +39,8 @@ lerf_method = MethodSpecification(
             model=LERFModelConfig(
                 eval_num_rays_per_chunk=1 << 15,
                 # NOTE: exceeding 16 layers per hashgrid causes a segfault within Tiny CUDA NN, so instead we compose multiple hashgrids together
-                hashgrid_sizes=(19, 19),
-                hashgrid_layers=(11, 11),
+                hashgrid_sizes=(15, 15),
+                hashgrid_layers=(8, 8),
                 hashgrid_resolutions=((16, 128), (128, 512)),
                 num_lerf_samples=25,
             ),

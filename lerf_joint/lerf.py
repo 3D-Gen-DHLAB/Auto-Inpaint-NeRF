@@ -27,11 +27,11 @@ from lerf.lerf_renderers import CLIPRenderer, MeanRenderer
 class LERFModelConfig(NerfactoModelConfig):
     _target: Type = field(default_factory=lambda: LERFModel)
     
-    clip_loss_weight: float = 0.1
+    clip_loss_weight: float = 10.0
     n_scales: int = 30
     max_scale: float = 1.5 
     """maximum scale used to compute relevancy with"""
-    num_lerf_samples: int = 24
+    num_lerf_samples: int = 12
     hashgrid_layers: Tuple[int] = (12, 12)
     hashgrid_resolutions: Tuple[Tuple[int]] = ((16, 128), (128, 512))
     hashgrid_sizes: Tuple[int] = (19, 19)
@@ -58,6 +58,8 @@ class LERFModel(NerfactoModel):
         self.suppress_train = False
         self.suppress_loss = False
         self.step_counter = 0
+
+        self.use_clip_loss = True
         # populate some viewer logic
         # TODO use the values from this code to select the scale
         # def scale_cb(element):
@@ -97,6 +99,8 @@ class LERFModel(NerfactoModel):
        
         n_phrases_maxs = [None for _ in range(n_phrases)]
         n_phrases_sims = [None for _ in range(n_phrases)]
+
+
         for i, scale in enumerate(scales_list):
             scale = scale.item()
             with torch.no_grad():
@@ -190,16 +194,17 @@ class LERFModel(NerfactoModel):
     def get_outputs(self, ray_bundle: RayBundle):
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         ray_samples_list.append(ray_samples)
-
+        
         nerfacto_field_outputs, outputs, weights = self._get_outputs_nerfacto(ray_samples)
         lerf_weights, best_ids = torch.topk(weights, self.config.num_lerf_samples, dim=-2, sorted=False)
-
+        #print(torch.cat((ray_samples,nerfacto_field_outputs['embeds'])).shape)
         def gather_fn(tens):
             return torch.gather(tens, -2, best_ids.expand(*best_ids.shape[:-1], tens.shape[-1]))
-
+        
         dataclass_fn = lambda dc: dc._apply_fn_to_fields(gather_fn, dataclass_fn)
         lerf_samples = ray_samples._apply_fn_to_fields(gather_fn, dataclass_fn)
-
+        
+        
         if self.training:
             clip_scales = ray_bundle.metadata["clip_scales"]
             clip_scales = clip_scales[..., None]
@@ -218,7 +223,7 @@ class LERFModel(NerfactoModel):
         for i in range(self.config.num_proposal_iterations):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
 
-        lerf_field_outputs = self.lerf_field.get_outputs(lerf_samples, clip_scales)
+        lerf_field_outputs = self.lerf_field.get_outputs(lerf_samples, clip_scales,  gather_fn(nerfacto_field_outputs['embeds']))
 
         if self.training:
             outputs["clip"] = self.renderer_clip(
@@ -280,13 +285,11 @@ class LERFModel(NerfactoModel):
             with torch.no_grad():
                 
                 if self.suppress: 
-
-                    
                     
                     max_across, best_scales = self.get_room_across(
                         lerf_samples,
                         lerf_weights,
-                        lerf_field_outputs[LERFFieldHeadNames.HASHGRID],
+                        gather_fn(nerfacto_field_outputs['embeds']),
                         clip_scales.shape,
                         preset_scales=override_scales,
                     )
@@ -308,6 +311,8 @@ class LERFModel(NerfactoModel):
                     #outputs['rgb'][:, 0] = outputs['rgb'][:, 0]*(outputs["raw_relevancy"] >= threshold).long().squeeze()
                     #outputs['rgb'][:, 1] = outputs['rgb'][:, 1]*(outputs["raw_relevancy"] >= threshold).long().squeeze()
                     #outputs['rgb'][:, 2] = outputs['rgb'][:, 2]*(outputs["raw_relevancy"] >= threshold).long().squeeze()
+                
+                   
                 else:
                     max_across, best_scales = self.get_max_across(
                         lerf_samples,
@@ -382,7 +387,7 @@ class LERFModel(NerfactoModel):
     def _get_outputs_nerfacto(self, ray_samples: RaySamples):
         field_outputs = self.field(ray_samples, compute_normals=self.config.predict_normals)
         weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
-
+        
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
         depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
@@ -397,13 +402,14 @@ class LERFModel(NerfactoModel):
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
-        if self.training:
+        if self.training and self.use_clip_loss:
             unreduced_clip = self.config.clip_loss_weight * torch.nn.functional.huber_loss(
                 outputs["clip"], batch["clip"], delta=1.25, reduction="none"
             )
+            
             loss_dict["clip_loss"] = unreduced_clip.sum(dim=-1).nanmean()
-            unreduced_dino = torch.nn.functional.mse_loss(outputs["dino"], batch["dino"], reduction="none")
-            loss_dict["dino_loss"] = unreduced_dino.sum(dim=-1).nanmean()
+            #unreduced_dino = torch.nn.functional.mse_loss(outputs["dino"], batch["dino"], reduction="none")
+            #loss_dict["dino_loss"] = unreduced_dino.sum(dim=-1).nanmean()
             if self.suppress_loss:
                 try:
                     ones = torch.ones_like(outputs["max_across"].squeeze())

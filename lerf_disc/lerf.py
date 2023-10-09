@@ -6,6 +6,9 @@ import random
 import numpy as np
 import open_clip
 import torch
+from torch import nn
+from torch import optim
+
 from nerfstudio.cameras.rays import RayBundle, RaySamples
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -21,7 +24,8 @@ from lerf.encoders.image_encoder import BaseImageEncoder
 from lerf.lerf_field import LERFField
 from lerf.lerf_fieldheadnames import LERFFieldHeadNames
 from lerf.lerf_renderers import CLIPRenderer, MeanRenderer
-
+ 
+import torchvision
 
 @dataclass
 class LERFModelConfig(NerfactoModelConfig):
@@ -58,6 +62,20 @@ class LERFModel(NerfactoModel):
         self.suppress_train = False
         self.suppress_loss = False
         self.step_counter = 0
+
+        device = 'cuda:0'
+        lr_d= 4e-4
+
+        self.discriminator = Discriminator().to(device)
+        
+        self.criterion = torch.nn.BCEWithLogitsLoss()
+
+        self.optim_d = optim.Adam(self.discriminator.parameters(), lr=lr_d, betas=((0.5, 0.999)))
+
+        self.target_ones = torch.ones((1, 1), device=device)
+        self.target_zeros = torch.zeros((1, 1), device=device)
+
+        
         # populate some viewer logic
         # TODO use the values from this code to select the scale
         # def scale_cb(element):
@@ -188,8 +206,10 @@ class LERFModel(NerfactoModel):
         """
 
     def get_outputs(self, ray_bundle: RayBundle):
+        
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         ray_samples_list.append(ray_samples)
+        
 
         nerfacto_field_outputs, outputs, weights = self._get_outputs_nerfacto(ray_samples)
         lerf_weights, best_ids = torch.topk(weights, self.config.num_lerf_samples, dim=-2, sorted=False)
@@ -395,6 +415,43 @@ class LERFModel(NerfactoModel):
 
         return field_outputs, outputs, weights
 
+    def get_discriminator_loss(self, nerf_samples):
+
+        nerf_samples = nerf_samples[None, :, :]
+
+        nerf_samples = torch.permute(nerf_samples, (2, 1, 0))
+        
+        classifications = self.discriminator(nerf_samples)
+
+        loss = self.criterion(classifications, self.target_ones)
+       
+        return loss
+
+    def train_step_discriminator(self, real_samples, nerf_samples):
+
+        real_samples = real_samples.to(self.device)
+
+        nerf_samples = torch.permute(nerf_samples[None, :, :], (2, 1, 0))
+        real_samples = torch.permute(real_samples[None, :, :], (2, 1, 0))
+
+        pred_real = self.discriminator(real_samples)
+        loss_real = self.criterion(pred_real, self.target_ones)
+
+        pred_fake = self.discriminator(nerf_samples)
+       
+        loss_fake = self.criterion(pred_fake, self.target_zeros)
+
+        loss = (loss_real + loss_fake) / 2
+
+        loss.backward()
+
+        self.optim_d.step()
+
+        self.discriminator.zero_grad()
+
+        return loss
+
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
         if self.training:
@@ -404,6 +461,10 @@ class LERFModel(NerfactoModel):
             loss_dict["clip_loss"] = unreduced_clip.sum(dim=-1).nanmean()
             unreduced_dino = torch.nn.functional.mse_loss(outputs["dino"], batch["dino"], reduction="none")
             loss_dict["dino_loss"] = unreduced_dino.sum(dim=-1).nanmean()
+            
+            image = batch["image"].to(self.device)
+            loss_dict["nerf_disc_loss"] = self.get_discriminator_loss(outputs["rgb"])*0.1
+            
             if self.suppress_loss:
                 try:
                     ones = torch.ones_like(outputs["max_across"].squeeze())
@@ -417,3 +478,40 @@ class LERFModel(NerfactoModel):
         param_groups = super().get_param_groups()
         param_groups["lerf"] = list(self.lerf_field.parameters())
         return param_groups
+
+class Discriminator(nn.Module):
+
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self._init_modules()
+
+    def _init_modules(self):
+
+        self.linear1 = nn.Linear(3*4096, 1024, bias=True)
+
+        self.leaky_relu = nn.LeakyReLU()
+        self.dropout_1d = nn.Dropout1d(0.3)
+
+        self.linear2 = nn.Linear(1024, 256, bias=True)
+
+        self.linear3 = nn.Linear(256, 1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_tensor):
+        input_tensor = torch.reshape(input_tensor, (1, 4096*3))
+        intermediate = self.linear1(input_tensor)
+        intermediate = self.leaky_relu(intermediate)
+        
+        intermediate = self.dropout_1d(intermediate)
+        
+        intermediate = self.linear2(intermediate)
+        intermediate = self.leaky_relu(intermediate)
+        
+        intermediate = self.dropout_1d(intermediate)
+        
+        output_tensor = self.linear3(intermediate)
+        #output_tensor = self.sigmoid(intermediate)
+
+        return output_tensor
+
+

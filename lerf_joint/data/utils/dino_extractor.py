@@ -42,7 +42,6 @@ class ViTExtractor:
         else:
             self.model = ViTExtractor.create_model(model_type)
 
-        
         self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
         self.model.eval()
         self.model.to(self.device)

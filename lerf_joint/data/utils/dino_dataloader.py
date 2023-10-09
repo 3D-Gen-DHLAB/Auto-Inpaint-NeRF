@@ -26,7 +26,7 @@ class DinoDataloader(FeatureDataloader):
         super().__init__(cfg, device, image_list, cache_path)
 
     def create(self, image_list):
-        
+        print('this is here')
         print(self.dino_model_type)
         extractor = ViTExtractor(self.dino_model_type, self.dino_stride)
         preproc_image_lst = extractor.preprocess(image_list, self.dino_load_size)[0].to(self.device)
